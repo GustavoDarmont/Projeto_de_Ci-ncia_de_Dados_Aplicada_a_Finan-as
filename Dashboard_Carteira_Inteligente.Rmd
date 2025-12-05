@@ -1,0 +1,1817 @@
+---
+title: "Dashboard Carteira Inteligente"
+author: "Gustavo Darmont de Faria Lima"
+date: "2025-12-02"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: flatly
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Load required libraries
+library(shiny)
+library(flexdashboard)
+library(yfR)
+library(quantmod)
+library(PerformanceAnalytics)
+library(dplyr)
+library(lubridate)
+library(rbcb)
+library(cluster)
+library(factoextra)
+library(ggplot2)
+library(plotly)
+library(DT)
+```
+
+```{r data-fetching, include=FALSE}
+# ============================================================================
+# OBTENÇÃO DE DADOS E ENGENHARIA DE FEATURE
+# ============================================================================
+
+# 1. Define o Universo de Ativos
+# Top 29 Ações Brasileiras Mais Líquidas
+ibovespa_stocks <- c(
+  "VALE3.SA", "ITUB4.SA", "PETR4.SA", "BBDC4.SA", "PETR3.SA", 
+  "B3SA3.SA", "BBAS3.SA", "ITSA4.SA", "ABEV3.SA", "BPAC11.SA", 
+  "WEGE3.SA", "RENT3.SA", "SBSP3.SA", "RDOR3.SA", "PRIO3.SA", 
+  "GGBR4.SA", "EQTL3.SA", "ENEV3.SA", "SUZB3.SA", "RADL3.SA", 
+  "VBBR3.SA", "EMBR3.SA", "VIVT3.SA", "CPLE6.SA", "TOTS3.SA", 
+  "UGPA3.SA", "LREN3.SA", "MGLU3.SA", "SANB11.SA", "BBSE3.SA"
+)
+
+# 10 ETFs Líquidos
+etfs <- c(
+  "IVVB11.SA", "BOVA11.SA", "SMAL11.SA", "DIVO11.SA", "FIND11.SA",
+  "ISUS11.SA", "SPXI11.SA", "BBSD11.SA", "HASH11.SA", "CRIP11.SA"
+)
+
+# Commodities e FX
+commodities_fx <- c("BTC-USD", "GC=F", "BRL=X")
+
+# Combina todos os tickers
+all_tickers <- c(ibovespa_stocks, etfs, commodities_fx)
+
+# 2. Função para Download dos Preços Ajustados
+download_prices <- function(tickers, start_date = NULL, end_date = NULL) {
+  # Default: últimos 5 anos se não especificado
+  if (is.null(start_date)) {
+    start_date <- Sys.Date() - years(5)
+  }
+  if (is.null(end_date)) {
+    end_date <- Sys.Date()
+  }
+  
+  # Usa yfR para baixar os dados
+  prices_list <- list()
+  
+  for (ticker in tickers) {
+    tryCatch({
+      cat("Baixando", ticker, "...\n")
+      df_price <- yf_get(
+        tickers = ticker,
+        first_date = start_date,
+        last_date = end_date,
+        freq_data = "daily"
+      )
+      
+      if (nrow(df_price) > 0) {
+        # Extrai preços de fechamento ajustados
+        prices_list[[ticker]] <- xts(
+          df_price$price_adjusted,
+          order.by = df_price$ref_date
+        )
+        names(prices_list[[ticker]]) <- ticker
+      }
+    }, error = function(e) {
+      cat("Erro ao baixar ", ticker, ":", e$message, "\n")
+    })
+  }
+  
+  # Combina todos os preços em um único objeto xts
+  if (length(prices_list) > 0) {
+    prices_xts <- do.call(merge, prices_list)
+    return(prices_xts)
+  } else {
+    return(NULL)
+  }
+}
+
+# 3. Cria um CDB Sintético (100% of CDI)
+create_synthetic_cdb <- function(start_date = NULL, end_date = NULL) {
+  # Default: últimos 5 anos
+  if (is.null(start_date)) {
+    start_date <- Sys.Date() - years(5)
+  }
+  if (is.null(end_date)) {
+    end_date <- Sys.Date()
+  }
+  
+  # Tenta pegar o CDI do rbcb
+  tryCatch({
+    # Pegar CDI taxa diária do rbcb
+    cdi_data <- get_series(c(CDI = 12), start_date = start_date, end_date = end_date)
+    
+    if (!is.null(cdi_data) && nrow(cdi_data) > 0) {
+      # Converte CDI anual para taxa diária
+      cdi_data$daily_rate <- (1 + cdi_data$CDI / 100)^(1/252) - 1
+      
+      # Cria uma série de retornos acumulados (começando em 100)
+      cdi_data$cumulative <- cumprod(1 + cdi_data$daily_rate) * 100
+      
+      # Cria um objeto xts
+      cdb_xts <- xts(
+        cdi_data$cumulative,
+        order.by = cdi_data$date
+      )
+      names(cdb_xts) <- "CDB_Synthetic"
+      
+      return(cdb_xts)
+    }
+  }, error = function(e) {
+    cat("rbcb não disponível ou erro. Usando aproximação fixa do CDI (14,5%).\n")
+  })
+  
+  # Fallback: Usa uma aproximação de CDI fixo com base na atual curva de juros
+  annual_cdi <- 0.145  # 14.5% a.a.
+  daily_cdi <- (1 + annual_cdi)^(1/252) - 1
+  
+  # Cria uma sequecia de datas apenas com dias úteis
+  date_seq <- seq(from = start_date, to = end_date, by = "day")
+  date_seq <- date_seq[wday(date_seq, week_start = 1) %in% 1:5]
+  
+  # Cria a série de retornos acumulativos
+  n_days <- length(date_seq)
+  daily_returns <- rep(daily_cdi, n_days)
+  cumulative <- cumprod(1 + daily_returns) * 100
+  
+  cdb_xts <- xts(cumulative, order.by = date_seq)
+  names(cdb_xts) <- "CDB_Synthetic"
+  
+  return(cdb_xts)
+}
+
+# 4. Calcula as Features: Retornos Anualizados, Volatilidade, Sharpe Ratio
+calculate_features <- function(prices_xts, risk_free_xts = NULL) {
+  # Calcula os retornos diários
+  returns_xts <- Return.calculate(prices_xts, method = "log")
+  returns_xts <- returns_xts[-1, ]  # Remove a primeira linha NA
+  
+  # Se a taxa livre de risco é fornecida, calcula os excessos de retorno
+  if (!is.null(risk_free_xts)) {
+    rf_returns <- Return.calculate(risk_free_xts, method = "log")
+    rf_returns <- rf_returns[-1, ]
+    
+    # Alinha as datas
+    common_dates <- intersect(index(returns_xts), index(rf_returns))
+    returns_xts <- returns_xts[common_dates, ]
+    rf_returns <- rf_returns[common_dates, ]
+    
+    # Calcula os excessos de retorno
+    excess_returns <- returns_xts - as.numeric(rf_returns)
+  } else {
+    excess_returns <- returns_xts
+  }
+  
+  # Calcula as features de cada ativo
+  features_list <- list()
+  
+  for (i in 1:ncol(returns_xts)) {
+    ticker <- names(returns_xts)[i]
+    asset_returns <- returns_xts[, i]
+    asset_returns <- asset_returns[!is.na(asset_returns)]
+    
+    if (length(asset_returns) > 0) {
+      # Retorno anualizado (252 dias de pregão)
+      annual_return <- mean(asset_returns, na.rm = TRUE) * 252
+      
+      # Volatilidade Anualizada
+      annual_vol <- sd(asset_returns, na.rm = TRUE) * sqrt(252)
+      
+      # Sharpe Ratio (assumindo Rf = CDI)
+      if (!is.null(risk_free_xts)) {
+        rf_annual <- mean(rf_returns, na.rm = TRUE) * 252
+        sharpe <- (annual_return - rf_annual) / annual_vol
+      } else {
+        sharpe <- annual_return / annual_vol
+      }
+      
+      features_list[[ticker]] <- data.frame(
+        Ticker = ticker,
+        Annualized_Return = annual_return,
+        Annualized_Volatility = annual_vol,
+        Sharpe_Ratio = sharpe,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  # Combinando em um único DataFrame
+  features_df <- do.call(rbind, features_list)
+  rownames(features_df) <- NULL
+  
+  return(features_df)
+}
+
+# Função de execução principal
+fetch_and_calculate_features <- function(start_date = NULL, end_date = NULL) {
+  cat("Passo 1: Obtendo os dados de mercado...\n")
+  
+  # Download dos preços de mercado
+  prices_xts <- download_prices(all_tickers, start_date, end_date)
+  
+  # Cria o CDB sintético
+  cat("Passo 2: Criando o CDB sintético...\n")
+  cdb_xts <- create_synthetic_cdb(start_date, end_date)
+  
+  # Une o CDB com os outros preços
+  if (!is.null(prices_xts) && !is.null(cdb_xts)) {
+    # Alinha as datas
+    common_dates <- intersect(index(prices_xts), index(cdb_xts))
+    prices_xts <- prices_xts[common_dates, ]
+    cdb_xts <- cdb_xts[common_dates, ]
+    
+    # Combina
+    all_prices_xts <- merge(prices_xts, cdb_xts)
+  } else if (!is.null(cdb_xts)) {
+    all_prices_xts <- cdb_xts
+  } else {
+    all_prices_xts <- prices_xts
+  }
+  
+  # Calcula as features
+  cat("Passo 3: Calculando as features...\n")
+  features_df <- calculate_features(all_prices_xts, cdb_xts)
+  
+  return(list(
+    prices = all_prices_xts,
+    cdb = cdb_xts,
+    features = features_df
+  ))
+}
+```
+
+```{r global-data-loading, include=FALSE}
+# ============================================================================
+# OTIMIZAÇÃO: CARREGAMENTO E ARMAZENAMENTO EM CACHE DE DADOS GLOBAIS
+# ============================================================================
+
+# Definindo o caminho para o arquivo de cache
+cache_file <- "market_data_cache.rds"
+
+# Função para carregar os dados com cache
+load_market_data <- function(force_update = FALSE) {
+  
+  # Verifica se o cache existe e que não estamos forçando um update
+  if (file.exists(cache_file) && !force_update) {
+    cat("Carregando os dados de mercado do cache...\n")
+    return(readRDS(cache_file))
+  } else {
+    cat("Cache não encontrado ou update forçado. Baixando os dados...\n")
+    
+    # Chama a função existente
+    data_results <- fetch_and_calculate_features() 
+    
+    # Valida os dados antes de salvar
+    if (!is.null(data_results) && nrow(data_results$features) > 0) {
+      saveRDS(data_results, cache_file)
+      cat("Dados salvos no cache.\n")
+      return(data_results)
+    } else {
+      warning("Download de dados falhou. Retornando NULL.")
+      return(NULL)
+    }
+  }
+}
+
+# EXECUTAR CARREGAMENTO NA INICIALIZAÇÃO
+# A variável 'GLOBAL_MARKET_DATA' estará disponível para todas as sessões
+GLOBAL_MARKET_DATA <- load_market_data()
+```
+
+```{r clustering, include=FALSE}
+# ============================================================================
+# ENGRENAGEM DO CLUSTERING VIA K-MEANS
+# ============================================================================
+
+# 1. Normaliza as Features
+normalize_features <- function(features_df) {
+  # Extract numeric features (excluding Ticker)
+  feature_cols <- c("Annualized_Return", "Annualized_Volatility", "Sharpe_Ratio")
+  
+  # Verifica se todas as coluas neessárias existem
+  if (!all(feature_cols %in% names(features_df))) {
+    stop("Required feature columns not found in features_df")
+  }
+  
+  # Extrai a matriz de features
+  features_matrix <- as.matrix(features_df[, feature_cols])
+  rownames(features_matrix) <- features_df$Ticker
+  
+  # Remove qualquer linha com NA ou valores infinitos
+  valid_rows <- complete.cases(features_matrix) & 
+                !is.infinite(rowSums(features_matrix))
+  features_matrix <- features_matrix[valid_rows, ]
+  
+  # Padroniza features (normalização z-score)
+  features_scaled <- scale(features_matrix)
+  
+  # Retorna a matriz em escala e os tickers validos
+  return(list(
+    scaled_features = features_scaled,
+    valid_tickers = rownames(features_scaled),
+    original_features = features_df[features_df$Ticker %in% rownames(features_scaled), ]
+  ))
+}
+
+# 2. Aplica o K-Means Clustering
+apply_kmeans <- function(scaled_features, k = 4, nstart = 25, iter.max = 100) {
+  kmeans_result <- kmeans(
+    scaled_features,
+    centers = k,
+    nstart = nstart,
+    iter.max = iter.max
+  )
+  
+  return(kmeans_result)
+}
+
+# 3. Generate Final Table with Cluster Assignments
+create_cluster_assignments <- function(features_df, kmeans_result, valid_tickers) {
+  # Create cluster assignments dataframe
+  cluster_assignments <- data.frame(
+    Ticker = valid_tickers,
+    Cluster_ID = kmeans_result$cluster,
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with original features
+  features_with_clusters <- merge(
+    features_df,
+    cluster_assignments,
+    by = "Ticker",
+    all.x = TRUE
+  )
+  
+  # Order by Cluster_ID and then by Sharpe_Ratio (descending)
+  features_with_clusters <- features_with_clusters[
+    order(features_with_clusters$Cluster_ID, 
+          -features_with_clusters$Sharpe_Ratio), 
+  ]
+  
+  return(features_with_clusters)
+}
+
+# Main Clustering Function
+perform_clustering <- function(features_df, k = 5) {
+  cat("Step 1: Normalizing features...\n")
+  
+  # Normalize features
+  normalized_data <- normalize_features(features_df)
+  scaled_features <- normalized_data$scaled_features
+  valid_tickers <- normalized_data$valid_tickers
+  
+  if (length(valid_tickers) < k) {
+    stop(paste("Not enough valid assets (", length(valid_tickers), 
+               ") for k =", k, "clusters"))
+  }
+  
+  cat("Step 2: Applying K-Means clustering (k =", k, ")...\n")
+  
+  # Apply K-Means
+  kmeans_result <- apply_kmeans(scaled_features, k = k)
+  
+  cat("Step 3: Creating cluster assignments table...\n")
+  
+  # Create final assignments table
+  cluster_assignments_df <- create_cluster_assignments(
+    features_df,
+    kmeans_result,
+    valid_tickers
+  )
+  
+  return(list(
+    cluster_assignments = cluster_assignments_df,
+    kmeans_model = kmeans_result,
+    scaled_features = scaled_features,
+    valid_tickers = valid_tickers
+  ))
+}
+```
+
+```{r cluster-plot-logic, include=FALSE}
+# ============================================================================
+# CLUSTER VISUALIZATION FUNCTION
+# ============================================================================
+
+create_cluster_plot <- function(cluster_assignments_df) {
+  
+  # Preparar dados para plotagem
+  plot_df <- cluster_assignments_df %>%
+    # Remover linhas NA que possam ter sido geradas por erros de download
+    filter(!is.na(Cluster_ID)) %>%
+    mutate(
+      Cluster_ID = factor(Cluster_ID),
+      # Identificar o ativo "Best in Class" (Maior Sharpe) por cluster
+      Is_Best = Ticker %in% select_best_asset_per_cluster(cluster_assignments_df)$Ticker,
+      
+      # Formatar para exibição
+      Sharpe_Ratio_Text = paste("Sharpe:", round(Sharpe_Ratio, 3)),
+      Return_Text = paste("Retorno:", scales::percent(Annualized_Return, accuracy = 0.1)),
+      Vol_Text = paste("Volatilidade:", scales::percent(Annualized_Volatility, accuracy = 0.1))
+    )
+  
+  # Criar o gráfico base com ggplot2
+  p <- ggplot(plot_df, aes(
+    x = Annualized_Volatility, 
+    y = Annualized_Return, 
+    color = Cluster_ID,
+    # Dados para o tooltip do Plotly
+    customdata = Ticker,
+    text = paste(
+      "Ticker:", Ticker, "<br>",
+      Return_Text, "<br>",
+      Vol_Text, "<br>",
+      Sharpe_Ratio_Text
+    )
+  )) +
+    geom_point(aes(size = Sharpe_Ratio), alpha = 0.6) +
+    # Destacar os ativos selecionados para o portfólio
+    geom_point(data = filter(plot_df, Is_Best), 
+               aes(fill = Cluster_ID), 
+               shape = 21, color = "black", size = 5, stroke = 1.5) +
+    # Adicionar centroides (opcional, requer o objeto kmeans_model)
+    # geom_point(data = as.data.frame(kmeans_model$centers), ...) 
+    
+    scale_x_continuous(labels = scales::percent) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(
+      title = "Clusters de Ativos: Retorno vs. Volatilidade",
+      x = "Volatilidade Anualizada",
+      y = "Retorno Anualizado",
+      color = "Cluster ID",
+      size = "Sharpe Ratio"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  # Converter para Plotly para interatividade
+  fig <- ggplotly(p, tooltip = "text") %>%
+    layout(
+      hoverlabel = list(bgcolor = "white"),
+      margin = list(t = 50, b = 150, l = 50, r = 50)
+    )
+  
+  return(fig)
+}
+```
+
+```{r suitability-logic, include=FALSE}
+# ============================================================================
+# Passo 3: Análise de Perfil do Investidor (API) - CVM 539
+# ============================================================================
+
+# Calcula o perfil do investidor com base nas regras e orientações da instrução CVM 539
+calculate_investor_profile <- function(answers) {
+  # Score inicial
+  score <- 0
+  
+  # Pergunta 1: Conhecimento de Finanças (0-20 pontos)
+  # Mais conhecimento = Score mais alto
+  if (answers$financial_knowledge == "Nenhum conhecimento") {
+    score <- score + 0
+  } else if (answers$financial_knowledge == "Básico") {
+    score <- score + 5
+  } else if (answers$financial_knowledge == "Intermediário") {
+    score <- score + 10
+  } else if (answers$financial_knowledge == "Avançado") {
+    score <- score + 15
+  } else if (answers$financial_knowledge == "Especialista") {
+    score <- score + 20
+  }
+  
+  # Pergunta 2: Tolerância a Risco (0-25 points)
+  # Maior tolerância = Score mais alto
+  if (answers$risk_tolerance == "Muito Conservador") {
+    score <- score + 5
+  } else if (answers$risk_tolerance == "Conservador") {
+    score <- score + 10
+  } else if (answers$risk_tolerance == "Moderado") {
+    score <- score + 15
+  } else if (answers$risk_tolerance == "Arrojado") {
+    score <- score + 20
+  } else if (answers$risk_tolerance == "Muito Arrojado") {
+    score <- score + 25
+  }
+  
+  # Pergunta 3: Comportamento Financeiro (0-15 points)
+  # Comportamentos anti-cíclicos = Score mais alto
+  if (answers$investment_behaviour == "Venderia") {
+    score <- score + 0
+  } else if (answers$investment_behaviour == "Manteria") {
+    score <- score + 10
+  } else if (answers$investment_behaviour == "Compraria") {
+    score <- score + 15
+  }
+  
+  # Pergunta 4: Horizonte de Investimentos (0-25 points)
+  # Maior horizonte = Maior tolerância a risco = Score mais alto
+  if (answers$time_horizon == "Menos de 1 ano") {
+    score <- score + 5
+  } else if (answers$time_horizon == "1 a 3 anos") {
+    score <- score + 10
+  } else if (answers$time_horizon == "3 a 5 anos") {
+    score <- score + 15
+  } else if (answers$time_horizon == "5 a 10 anos") {
+    score <- score + 20
+  } else if (answers$time_horizon == "Mais de 10 anos") {
+    score <- score + 25
+  }
+  
+  # Pergunta 5: Necessidade de Liquidez (0-15 points)
+  # Menor necessidade de liquidez = Score mais alto
+  if (answers$liquidity_needs == "Muito alta") {
+    score <- score + 0
+  } else if (answers$liquidity_needs == "Alta") {
+    score <- score + 5
+  } else if (answers$liquidity_needs == "Média") {
+    score <- score + 10
+  } else if (answers$liquidity_needs == "Baixa") {
+    score <- score + 15
+  }
+  
+  # Determinando o perfil com base no score
+  if (score <= 35) {
+    profile <- "Conservative"
+    profile_pt <- "Conservador"
+  } else if (score <= 70) {
+    profile <- "Moderate"
+    profile_pt <- "Moderado"
+  } else {
+    profile <- "Aggressive"
+    profile_pt <- "Agressivo"
+  }
+  
+  return(list(
+    score = score,
+    profile = profile,
+    profile_pt = profile_pt,
+    max_score = 100
+  ))
+}
+```
+
+```{r backtesting-logic, include=FALSE}
+# ============================================================================
+# STEP 5: BACKTESTING & RISK ENGINE
+# ============================================================================
+
+calculate_backtest_performance <- function(portfolio_df, market_data) {
+  
+  # 1. Prepare Data
+  target_tickers <- portfolio_df$Ticker
+  weights <- portfolio_df$Weight
+  names(weights) <- target_tickers
+  
+  # Get historical prices for the selected assets
+  # Check intersection to avoid errors if a ticker is missing in prices
+  available_tickers <- intersect(target_tickers, colnames(market_data$prices))
+  asset_prices <- market_data$prices[, available_tickers]
+  
+  # Calculate asset daily returns
+  asset_returns <- Return.calculate(asset_prices, method = "log")
+  asset_returns <- asset_returns[-1, ] 
+  asset_returns <- na.omit(asset_returns) 
+  
+  # 2. Calculate Portfolio Returns
+  # Align weights with available tickers
+  weights <- weights[available_tickers]
+  weights <- weights / sum(weights) # Re-normalize to 1
+  
+  portfolio_ret <- Return.portfolio(asset_returns, weights = weights, rebalance_on = "days")
+  names(portfolio_ret) <- "Carteira_Recomendada"
+  
+  # 3. Calculate Benchmarks
+  
+  # A. Benchmark de Mercado (BOVA11)
+  # Verifica se BOVA11 existe para evitar crash
+  if ("BOVA11.SA" %in% colnames(market_data$prices)) {
+    bova_prices <- market_data$prices[, "BOVA11.SA"]
+    market_ret <- Return.calculate(bova_prices, method = "log")[-1, ]
+  } else {
+    # Fallback: Média de mercado se não houver BOVA11
+    market_ret <- Return.portfolio(Return.calculate(market_data$prices, "log")[-1,], rebalance_on="days")
+  }
+  names(market_ret) <- "Benchmark_Mercado" # Nome corrigido para o gráfico
+  
+  # B. CDI (Risk Free)
+  cdi_prices <- market_data$cdb
+  cdi_ret <- Return.calculate(cdi_prices, method = "log")[-1, ]
+  names(cdi_ret) <- "CDI_CDB"
+  
+  # 4. Merge All Series
+  # CORREÇÃO AQUI: Trocado 'ew_ret' por 'market_ret'
+  all_ret <- merge(portfolio_ret, market_ret, cdi_ret)
+  all_ret <- na.omit(all_ret)
+  
+  # 5. Calculate Cumulative Returns (Wealth Index)
+  wealth_index <- cumprod(1 + all_ret) * 100
+  
+  # 6. Calculate Risk Metrics (for the Recommended Portfolio only)
+  total_return <- tail(wealth_index$Carteira_Recomendada, 1) / 100 - 1
+  ann_vol <- StdDev.annualized(portfolio_ret, scale = 252)
+  var_95 <- VaR(portfolio_ret, p = 0.95, method = "gaussian")
+  max_dd <- maxDrawdown(portfolio_ret)
+  
+  return(list(
+    daily_returns = all_ret,
+    wealth_index = wealth_index,
+    metrics = list(
+      total_return = as.numeric(total_return),
+      volatility = as.numeric(ann_vol),
+      var_95 = as.numeric(var_95),
+      max_drawdown = as.numeric(max_dd)
+    )
+  ))
+}
+```
+
+```{r monte-carlo-logic, include=FALSE}
+# ============================================================================
+# ENGRENAGEM DA PROJEÇÃO DE MONTE CARLO (Geometric Brownian Motion)
+# ============================================================================
+
+# Parâmetros de input para a simulação (usados como valores iniciais)
+initial_investment_default <- 10000
+monthly_contribution_default <- 500
+n_years <- 5
+n_simulations <- 100
+n_trading_days_year <- 252
+
+run_monte_carlo_gbm <- function(portfolio_metrics) {
+  
+  # 1. Extrair Parâmetros do Portfólio
+  mu <- portfolio_metrics$expected_return # Retorno Anualizado
+  sigma <- portfolio_metrics$expected_volatility # Volatilidade Anualizada
+  
+  # 2. Parâmetros da Simulação (em passos diários para 5 anos)
+  N <- n_years * n_trading_days_year
+  dt <- 1 / n_trading_days_year  # Passo de tempo (1 dia)
+  
+  # 3. Executar as Simulações
+  simulated_paths <- matrix(NA, nrow = N + 1, ncol = n_simulations)
+  
+  # Preencher a primeira linha (Dia 0) com o valor de 1 (para cálculo de retorno)
+  simulated_paths[1, ] <- 1
+  
+  for (j in 1:n_simulations) {
+    # Criar ruído (componente estocástica)
+    epsilon <- rnorm(N, mean = 0, sd = 1)
+    
+    # Calcular o retorno diário (dR) usando GBM
+    daily_returns <- (mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * epsilon
+    
+    # Calcular o valor acumulado (Wealth Index)
+    for (i in 1:N) {
+      simulated_paths[i + 1, j] <- simulated_paths[i, j] * exp(daily_returns[i])
+    }
+  }
+  
+  # 4. Processar Resultados e Estatísticas
+  # Adicionar coluna de dias
+  sim_df <- data.frame(Day = 0:N)
+  
+  # Transpor e adicionar caminhos simulados
+  sim_paths_df <- as.data.frame(simulated_paths)
+  names(sim_paths_df) <- paste0("Path_", 1:n_simulations)
+  
+  # Merge com o índice de dias
+  sim_df <- cbind(sim_df, sim_paths_df)
+  
+  # Calcular percentis e mediana
+  sim_df$Median <- apply(simulated_paths, 1, median)
+  sim_df$P05 <- apply(simulated_paths, 1, quantile, probs = 0.05)
+  sim_df$P95 <- apply(simulated_paths, 1, quantile, probs = 0.95)
+  
+  # Adicionar data fictícia para o gráfico (para eixo X)
+  start_date <- Sys.Date()
+  sim_df$Date <- seq(from = start_date, by = "day", length.out = N + 1)
+  
+  return(sim_df)
+}
+
+# Função auxiliar para calcular o valor final com contribuições
+calculate_final_value <- function(mc_df, initial_investment, monthly_contribution, metrics) {
+  
+  # Usa a Mediana (Percentil 50) como projeção central
+  median_return_factor <- tail(mc_df$Median, 1)
+  
+  # 1. Projeção de Investimento Inicial
+  final_value_initial <- initial_investment * median_return_factor
+  
+  # 2. Projeção de Contribuições Mensais
+  # Usa a taxa anual de retorno vinda explicitamente do argumento 'metrics'
+  monthly_rate <- (1 + metrics$expected_return)^(1/12) - 1
+  n_periods <- n_years * 12
+  
+  # Valor Futuro de uma Série de Pagamentos (Anuidade)
+  final_value_contributions <- monthly_contribution * (( (1 + monthly_rate)^n_periods - 1) / monthly_rate) * (1 + monthly_rate)
+  
+  final_value <- final_value_initial + final_value_contributions
+  
+  # Calcular os cenários final P05 e P95
+  p05_factor <- tail(mc_df$P05, 1)
+  p95_factor <- tail(mc_df$P95, 1)
+  
+  # Valor Final no Cenário P05
+  final_p05 <- (initial_investment * p05_factor) + 
+               (monthly_contribution * (( (1 + monthly_rate)^n_periods - 1) / monthly_rate) * (1 + monthly_rate))
+  
+  # Valor Final no Cenário P95
+  final_p95 <- (initial_investment * p95_factor) + 
+               (monthly_contribution * (( (1 + monthly_rate)^n_periods - 1) / monthly_rate) * (1 + monthly_rate))
+  
+  return(list(
+    final_value = final_value,
+    final_p05 = final_p05,
+    final_p95 = final_p95,
+    n_years = n_years
+  ))
+}
+```
+
+```{r ui-components}
+# ============================================================================
+# SHINY UI COMPONENTS
+# ============================================================================
+
+# 1ª Aba: Avaliação de Perfil do Investidor
+input_tab <- function() {
+  fluidPage(
+    titlePanel("Questionário de Avaliação do Perfil do Investidor (API) - CVM 539"),
+    br(),
+    
+    wellPanel(
+      h4("Instruções"),
+      p("Por favor, responda todas as questões abaixo para determinar seu perfil de investidor. 
+        As respostas são baseadas nas diretrizes da Instrução CVM 539."),
+      style = "background-color: #f8f9fa; padding: 15px; border-radius: 5px;"
+    ),
+    
+    br(),
+    
+    # Pergunta 1: Conhecimento de Finanças
+    wellPanel(
+      h5("1. Qual é o seu nível de conhecimento sobre investimentos?"),
+      radioButtons(
+        inputId = "financial_knowledge",
+        label = NULL,
+        choices = list(
+          "Nenhum conhecimento" = "Nenhum conhecimento",
+          "Básico (conheço poupança e CDB)" = "Básico",
+          "Intermediário (conheço ações e fundos)" = "Intermediário",
+          "Avançado (conheço derivativos e alavancagem)" = "Avançado",
+          "Especialista (trabalho na área financeira)" = "Especialista"
+        ),
+        selected = character(0)
+      )
+    ),
+    
+    # Pergunta 2: Tolerância a Risco
+    wellPanel(
+      h5("2. Qual é a sua tolerância ao risco?"),
+      radioButtons(
+        inputId = "risk_tolerance",
+        label = NULL,
+        choices = list(
+          "Muito Conservador (não aceito perdas)" = "Muito Conservador",
+          "Conservador (aceito pequenas perdas)" = "Conservador",
+          "Moderado (aceito perdas moderadas)" = "Moderado",
+          "Arrojado (aceito perdas significativas)" = "Arrojado",
+          "Muito Arrojado (aceito altas volatilidades)" = "Muito Arrojado"
+        ),
+        selected = character(0)
+      )
+    ),
+    
+    # Pergunta 3: Comportamento Financeiro
+    wellPanel(
+      h5("3. Como você reagiria a uma queda repentina no valor dos seus investimentos?"),
+      radioButtons(
+        inputId = "investment_behaviour",
+        label = NULL,
+        choices = list(
+          "Ficaria preocupado e consideraria vender para evitar maiores perdas" = "Venderia",
+          "Monitoraria a situação, mas manteria meus investimentos a longo prazo" = "Manteria",
+          "Aproveitaria a oportunidade para comprar mais, acreditando em uma recuperação futura" = "Compraria"
+        ),
+        selected = character(0)
+      )
+    ),
+   
+    # Pergunta 4: Horizonte de Investimentos
+    wellPanel(
+      h5("4. Qual é o seu horizonte de investimento?"),
+      radioButtons(
+        inputId = "time_horizon",
+        label = NULL,
+        choices = list(
+          "Menos de 1 ano" = "Menos de 1 ano",
+          "1 a 3 anos" = "1 a 3 anos",
+          "3 a 5 anos" = "3 a 5 anos",
+          "5 a 10 anos" = "5 a 10 anos",
+          "Mais de 10 anos" = "Mais de 10 anos"
+        ),
+        selected = character(0)
+      )
+    ),
+    
+    # Pergunta 5: Necessidade de Liquidez
+    wellPanel(
+      h5("5. Qual é a sua necessidade de liquidez?"),
+      radioButtons(
+        inputId = "liquidity_needs",
+        label = NULL,
+        choices = list(
+          "Muito alta (preciso acessar o dinheiro a qualquer momento)" = "Muito alta",
+          "Alta (posso esperar alguns meses)" = "Alta",
+          "Média (posso esperar até 1 ano)" = "Média",
+          "Baixa (posso esperar vários anos)" = "Baixa"
+        ),
+        selected = character(0)
+      )
+    ),
+    
+    br(),
+    
+    # Botão para Geração do Portifólio
+    div(
+      actionButton(
+        inputId = "generate_portfolio",
+        label = "Gerar Carteira Recomendada",
+        class = "btn-primary btn-lg",
+        style = "width: 100%; padding: 15px; font-size: 16px;"
+      ),
+      align = "center"
+    ),
+    
+    br(),
+    
+    # Apresentação do Diagnóstico de Perfil
+    conditionalPanel(
+      condition = "output.profile_calculated == true",
+      wellPanel(
+        h4("Seu Perfil de Investidor"),
+        verbatimTextOutput("investor_profile_output"),
+        style = "background-color: #e7f3ff; padding: 15px; border-radius: 5px; border: 2px solid #2196F3;"
+      )
+    )
+  )
+}
+
+# 2ª Aba: Portifólio Recomendado
+results_tab <- function() {
+  fluidPage(
+    titlePanel("Carteira Recomendada"),
+    
+    # Sumário de Métricas do Portifólio
+    conditionalPanel(
+      condition = "output.portfolio_generated == true",
+      fluidRow(
+        column(12,
+          wellPanel(
+            h4("Métricas da Carteira"),
+            fluidRow(
+              column(4,
+                h5("Retorno Esperado (Anualizado)"),
+                verbatimTextOutput("portfolio_return", placeholder = TRUE)
+              ),
+              column(4,
+                h5("Volatilidade Esperada (Anualizada)"),
+                verbatimTextOutput("portfolio_volatility", placeholder = TRUE)
+              ),
+              column(4,
+                h5("Sharpe Ratio"),
+                verbatimTextOutput("portfolio_sharpe", placeholder = TRUE)
+              )
+            ),
+            style = "background-color: #f0f8ff; padding: 15px; border-radius: 5px;"
+          )
+        )
+      )
+    ),
+    
+    br(),
+    
+    # Donut Chart
+    conditionalPanel(
+      condition = "output.portfolio_generated == true",
+      fluidRow(
+        column(12,
+          h4("Alocação da Carteira"),
+          plotlyOutput("portfolio_donut_chart", height = "500px")
+        )
+      )
+    ),
+    
+    br(),
+    
+    # Tabela do Portifólio
+    conditionalPanel(
+      condition = "output.portfolio_generated == true",
+      fluidRow(
+        column(12,
+          h4("Composição Detalhada da Carteira"),
+          DT::dataTableOutput("portfolio_table")
+        )
+      )
+    ),
+    
+    # Placeholder Quando o Portifólio Não é Gerado
+    conditionalPanel(
+      condition = "output.portfolio_generated == false",
+      wellPanel(
+        h4("Aguardando Geração da Carteira"),
+        p("Complete o questionário na aba 'Entrada de Dados' e clique em 'Gerar Carteira Recomendada' para ver os resultados aqui."),
+        style = "background-color: #fff9e6; padding: 20px; border-radius: 5px; text-align: center;"
+      )
+    )
+  )
+}
+```
+
+```{r server-logic}
+# ============================================================================
+# SHINY SERVER LOGIC
+# ============================================================================
+
+# --- FUNÇÃO AUXILIAR DE UI ---
+render_card_html <- function(value, caption, icon_name, bg_color, col_width = 12) {
+  
+  # Define cores baseadas no tema Flatly/Bootstrap
+  color_hex <- switch(bg_color,
+    "success" = "#18bc9c", # Verde
+    "danger"  = "#e74c3c", # Vermelho
+    "warning" = "#f39c12", # Laranja
+    "primary" = "#2c3e50", # Azul Escuro
+    "info"    = "#3498db", # Azul Claro
+    "gray"    = "#95a5a6", # Cinza
+    "orange"  = "#d35400", # Laranja Escuro
+    "#2c3e50" # Default
+  )
+  
+  # Estrutura HTML do Card
+  div(
+    class = paste0("col-sm-6 col-md-", col_width), 
+    style = "padding: 5px; margin-bottom: 5px;",
+    
+    div(
+      style = paste0(
+        "background-color: ", color_hex, "; ",
+        "color: white; ",
+        "border-radius: 5px; ",
+        "padding: 8px; ",
+        "box-shadow: 0 2px 4px rgba(0,0,0,0.1); ",
+        "position: relative; overflow: hidden; min-height: 60px;"
+      ),
+      
+      # Valor Principal
+      h3(value, style = "margin-top: 2px; margin-bottom: 2px; font-weight: bold; font-size: 20px;"),
+      
+      # Legenda
+      p(caption, style = "font-size: 16px; opacity: 0.9; margin-bottom: 0; line-height: 1.1;"),
+      
+      # Ícone
+      div(
+        icon(icon_name), 
+        style = "position: absolute; right: 10px; top: 10px; font-size: 25px; opacity: 0.3;"
+      )
+    )
+  )
+}
+
+# Valores reativos para armazenar o perfil do investidor
+investor_profile <- reactiveValues(
+  score = NULL,
+  profile = NULL,
+  profile_pt = NULL,
+  calculated = FALSE
+)
+
+# Valores reativos para armazenar dados do portifólio e de mercado
+portfolio_data <- reactiveValues(
+  portfolio_df = NULL,
+  portfolio_metrics = NULL,
+  generated = FALSE,
+  market_data = GLOBAL_MARKET_DATA,
+  clustering_results = NULL
+)
+
+# Evento: Botão de Gerar Portifólio Clicado
+observeEvent(input$generate_portfolio, {
+  # Valida se todas as perguntas foram respondidas
+  if (is.null(input$time_horizon) || 
+      is.null(input$risk_tolerance) || 
+      is.null(input$financial_knowledge) || 
+      is.null(input$liquidity_needs) || 
+      is.null(input$investment_behaviour)) {
+    
+    showNotification(
+      "Por favor, responda todas as questões antes de gerar a carteira.",
+      type = "warning",
+      duration = 5
+    )
+    return()
+  }
+  
+  # Coleta as respostas
+  answers <- list(
+    time_horizon = input$time_horizon,
+    risk_tolerance = input$risk_tolerance,
+    financial_knowledge = input$financial_knowledge,
+    liquidity_needs = input$liquidity_needs,
+    investment_behaviour = input$investment_behaviour
+  )
+  
+  # Calcula o perfil
+  profile_result <- calculate_investor_profile(answers)
+  
+  # Armazena nos valores reativos
+  investor_profile$score <- profile_result$score
+  investor_profile$profile <- profile_result$profile
+  investor_profile$profile_pt <- profile_result$profile_pt
+  investor_profile$calculated <- TRUE
+  
+  # Mostra notificação
+  showNotification(
+    paste0("Perfil calculado: ", profile_result$profile_pt, " (Score: ", 
+           profile_result$score, "/100)"),
+    type = "message",
+    duration = 5
+  )
+  
+  # Gatilho de geração de portifólio
+  # Isso será contornado em um observeEvent separado para o botão
+})
+
+observe({
+  
+  # 1. Gatilhos
+  req(investor_profile$calculated == TRUE)
+  
+  # Novo gatilho: Força o recálculo sempre que o perfil (Conservador/Moderado/Agressivo) mudar
+  profile_trigger <- investor_profile$profile 
+  
+  k_value <- input$num_assets 
+  req(k_value >= 4)
+  
+  # Gatilhos financeiros (para atualizar projeção se mudar o valor)
+  inv_inicial <- input$initial_investment
+  aport_mensal <- input$monthly_contribution
+  
+  # 2. Dados de Mercado
+  market_results <- portfolio_data$market_data
+  req(!is.null(market_results))
+  
+  # --- ISOLATE ---
+  # Isolamos o processamento pesado para evitar loops, 
+  # mas usamos os valores capturados acima (k_value, inv_inicial, etc)
+  isolate({ 
+    
+    showNotification(
+      paste0("Calculando cenários (k=", k_value, ")..."),
+      type = "message", duration = 3, id = "recalculating"
+    )
+    
+    tryCatch({
+      # --- PIPELINE DE CÁLCULO ---
+      
+      # Passo 2: Clustering
+      clustering_results <- perform_clustering(
+        market_results$features,
+        k = k_value
+      )
+      
+      # Passo 3: Construção do Portifólio
+      portfolio_result <- construct_portfolio(
+        clustering_results$cluster_assignments,
+        investor_profile$profile,
+        market_data = market_results,
+        n_clusters = k_value
+      )
+      
+      # Passo 4: Backtest
+      backtest_results <- calculate_backtest_performance(
+        portfolio_result$portfolio,
+        market_results
+      )
+      
+      # Passo 5: Monte Carlo
+      monte_carlo_df <- run_monte_carlo_gbm(portfolio_result$portfolio_metrics)
+      
+      # Passo 5b: Valor Final da Carteira Projetada
+      # Passamos 'portfolio_result$portfolio_metrics' explicitamente
+      final_value_results <- calculate_final_value(
+        mc_df = monte_carlo_df,
+        initial_investment = inv_inicial,    # Valor capturado do input
+        monthly_contribution = aport_mensal, # Valor capturado do input
+        metrics = portfolio_result$portfolio_metrics
+      )
+      
+      # --- ARMAZENAMENTO ---
+      portfolio_data$portfolio_df <- portfolio_result$portfolio
+      portfolio_data$portfolio_metrics <- portfolio_result$portfolio_metrics
+      portfolio_data$clustering_results <- clustering_results
+      portfolio_data$backtest_results <- backtest_results
+      portfolio_data$monte_carlo_results_df <- monte_carlo_df
+      portfolio_data$monte_carlo_results <- final_value_results
+      portfolio_data$generated <- TRUE 
+      
+      removeNotification("recalculating")
+      
+    }, error = function(e) {
+      removeNotification("recalculating")
+      print(e)
+      showNotification(paste0("Erro: ", e$message), type = "error", duration = 10)
+    })
+  }) 
+}, priority = 1)
+
+# Evento: Botão de Atualização dos Dados
+    observeEvent(input$update_data, {
+      showNotification("Atualizando dados de mercado... Isso pode demorar.", type = "message", id = "updating")
+      
+      tryCatch({
+        # Força a atualização usando a função criada no passo 1
+        new_data <- load_market_data(force_update = TRUE)
+        
+        if (!is.null(new_data)) {
+          # Atualiza o valor reativo para o app ver o novo dado
+          portfolio_data$market_data <- new_data
+          
+          # Atualiza a variavel global para sessões futuras (se rodando localmente)
+          GLOBAL_MARKET_DATA <<- new_data
+          
+          showNotification("Dados atualizados com sucesso!", type = "message")
+        } else {
+          showNotification("Falha ao baixar dados.", type = "error")
+        }
+      }, error = function(e) {
+        showNotification(paste("Erro:", e$message), type = "error")
+      }, finally = {
+        removeNotification("updating")
+      })
+    })
+
+# Output: Display do Perfil do Investidor
+output$investor_profile_output <- renderText({
+  if (investor_profile$calculated) {
+    paste0(
+      "Perfil: ", investor_profile$profile_pt, "\n",
+      "Score: ", investor_profile$score, " / ", 100, "\n",
+      "Nível de Risco: ", 
+      ifelse(investor_profile$profile == "Conservative", "Baixo",
+             ifelse(investor_profile$profile == "Moderate", "Médio", "Alto"))
+    )
+  } else {
+    "Complete o questionário e clique em 'Gerar Carteira Recomendada'"
+  }
+})
+
+# Output: Flag de Perfil Calculado (para conditionalPanel)
+output$profile_calculated <- reactive({
+  investor_profile$calculated
+})
+outputOptions(output, "profile_calculated", suspendWhenHidden = FALSE)
+
+# Output: Flag de Perfil Gerado
+output$portfolio_generated <- reactive({
+  portfolio_data$generated
+})
+outputOptions(output, "portfolio_generated", suspendWhenHidden = FALSE)
+
+# Output: Métricas do Portifólio
+output$portfolio_return <- renderText({
+  if (portfolio_data$generated && !is.null(portfolio_data$portfolio_metrics)) {
+    paste0(round(portfolio_data$portfolio_metrics$expected_return * 100, 2), "%")
+  } else {
+    "-"
+  }
+})
+
+output$portfolio_volatility <- renderText({
+  if (portfolio_data$generated && !is.null(portfolio_data$portfolio_metrics)) {
+    paste0(round(portfolio_data$portfolio_metrics$expected_volatility * 100, 2), "%")
+  } else {
+    "-"
+  }
+})
+
+output$portfolio_sharpe <- renderText({
+  if (portfolio_data$generated && !is.null(portfolio_data$portfolio_metrics)) {
+    round(portfolio_data$portfolio_metrics$sharpe_ratio, 3)
+  } else {
+    "-"
+  }
+})
+
+# Output: Plot do Gráfico de Visualização dos Clusters
+output$cluster_plot <- renderPlotly({
+  if (portfolio_data$generated && !is.null(portfolio_data$clustering_results)) {
+    
+    # Extrai o dataframe de atribuições de cluster
+    cluster_df <- portfolio_data$clustering_results$cluster_assignments
+    
+    # Gera o gráfico
+    create_cluster_plot(cluster_df)
+    
+  } else {
+    plotly_empty() %>%
+      layout(title = "Aguardando Clusters de Ativos")
+  }
+})
+
+# Output: Donut Chart do Portifólio
+output$portfolio_donut_chart <- renderPlotly({
+  if (portfolio_data$generated && !is.null(portfolio_data$portfolio_df)) {
+    create_portfolio_donut_chart(portfolio_data$portfolio_df)
+  } else {
+    plotly_empty() %>%
+      layout(
+        title = "Aguardando geração da carteira",
+        xaxis = list(visible = FALSE),
+        yaxis = list(visible = FALSE)
+      )
+  }
+})
+
+# Output: Tabela do Portfolio/Carteira
+output$portfolio_table <- DT::renderDataTable({
+  if (portfolio_data$generated && !is.null(portfolio_data$portfolio_df)) {
+    display_df <- portfolio_data$portfolio_df %>%
+      mutate(
+        Weight = round(Weight * 100, 2),
+        Annualized_Return = round(Annualized_Return * 100, 2),
+        Annualized_Volatility = round(Annualized_Volatility * 100, 2),
+        Sharpe_Ratio = round(Sharpe_Ratio, 3)
+      ) %>%
+      rename(
+        "Ticker" = Ticker,
+        "Cluster" = Cluster_ID,
+        "Peso (%)" = Weight,
+        "Retorno Anual (%)" = Annualized_Return,
+        "Volatilidade Anual (%)" = Annualized_Volatility,
+        "Sharpe Ratio" = Sharpe_Ratio
+      )
+    
+    DT::datatable(
+      display_df,
+      options = list(
+        pageLength = 10,
+        searching = FALSE,
+        ordering = TRUE,
+        dom = 't'
+      ),
+      rownames = FALSE
+    ) %>%
+      DT::formatStyle(
+        "Peso (%)",
+        backgroundColor = DT::styleInterval(
+          c(10, 20, 30),
+          c("#ffebee", "#fff3e0", "#e8f5e9", "#e3f2fd")
+        )
+      )
+  } else {
+    data.frame(Message = "Aguardando geração da carteira")
+  }
+})
+
+# Output: Gráfico de Evolução do Patrimônio
+output$wealth_index_chart <- renderPlotly({
+  if (portfolio_data$generated && !is.null(portfolio_data$backtest_results)) {
+    
+    # Extrai dada para a plotagem
+    wealth_xts <- portfolio_data$backtest_results$wealth_index
+    
+    # Converte para dataframe para o Plotly
+    df_plot <- data.frame(
+      Date = index(wealth_xts),
+      Carteira = as.numeric(wealth_xts$Carteira_Recomendada),
+      Benchmark_M = as.numeric(wealth_xts$Benchmark_Mercado),
+      CDI = as.numeric(wealth_xts$CDI_CDB)
+    )
+    
+    # Cria o Plot
+    plot_ly(df_plot, x = ~Date) %>%
+      add_trace(y = ~Carteira, name = 'Carteira Recomendada', type = 'scatter', mode = 'lines',
+                line = list(color = '#2e7d32', width = 3)) %>%
+      add_trace(y = ~CDI, name = 'CDI (Risk Free)', type = 'scatter', mode = 'lines',
+                line = list(color = '#000000', width = 1, dash = 'dash')) %>%
+      add_trace(y = ~Benchmark_M, name = 'Ibovespa (BOVA11)', type = 'scatter', mode = 'lines',
+                line = list(color = '#1976d2', width = 1)) %>%
+      layout(
+        title = "Evolução Patrimonial (Base 100)",
+        xaxis = list(title = ""),
+        yaxis = list(title = "Valor Acumulado"),
+        legend = list(orientation = "h", x = 0, y = -0.2),
+        margin = list(b = 100, r = 20, l = 50, t = 50),
+        hovermode = "x unified"
+      )
+    
+  } else {
+    plotly_empty()
+  }
+})
+
+# Output: Gráfico de Projeção de Monte Carlo
+output$monte_carlo_projection <- renderPlotly({
+  if (portfolio_data$generated && !is.null(portfolio_data$monte_carlo_results_df)) {
+    
+    mc_df <- portfolio_data$monte_carlo_results_df
+    
+    df_long <- mc_df %>%
+      select(Date, starts_with("Path_")) %>%
+      tidyr::pivot_longer(cols = starts_with("Path_"), names_to = "Simulation", values_to = "Value")
+    
+    fig <- plot_ly(df_long, x = ~Date) %>%
+      # Plotar todos os caminhos (maior transparência)
+      add_trace(y = ~Value, type = 'scatter', mode = 'lines',
+                line = list(color = 'rgba(100, 100, 100, 0.1)'),
+                group = ~Simulation, showlegend = FALSE) %>%
+      
+      # Plotar Cenário Otimista (Percentil 95)
+      add_trace(data = mc_df, y = ~P95, name = 'Cenário Otimista', type = 'scatter', mode = 'lines',
+                line = list(color = 'rgba(46, 125, 50, 0.8)', width = 2)) %>%
+      
+      # Plotar Mediana (Percentil 50)
+      add_trace(data = mc_df, y = ~Median, name = 'Mediana', type = 'scatter', mode = 'lines',
+                line = list(color = '#1976d2', width = 3)) %>%
+      
+      # Plotar Cenário Pessimista (Percentil 05)
+      add_trace(data = mc_df, y = ~P05, name = 'Cenário Pessimista', type = 'scatter', mode = 'lines',
+                line = list(color = 'rgba(211, 47, 47, 0.8)', width = 2)) %>%
+      
+      layout(
+        title = paste("Projeção do Retorno (100 Simulações)"),
+        xaxis = list(title = "Data"),
+        yaxis = list(title = "Índice de Riqueza (Base 1)"),
+        hovermode = "x unified",
+        legend = list(orientation = "h", y = -0.15, x = 0.5, xanchor = "center")
+      )
+    
+    return(fig)
+    
+  } else {
+    plotly_empty()
+  }
+})
+
+# Output: Gráfico de Drawdown
+output$drawdown_chart <- renderPlotly({
+  if (portfolio_data$generated && !is.null(portfolio_data$backtest_results)) {
+    
+    # Extrai os retornos do portfólio
+    returns_xts <- portfolio_data$backtest_results$daily_returns[, "Carteira_Recomendada"]
+    
+    # 1. Calcula a série de Drawdowns (usando PerformanceAnalytics)
+    dd_xts <- Drawdowns(returns_xts)
+    
+    # 2. Converte para dataframe para o Plotly
+    df_plot <- data.frame(
+      Date = index(dd_xts),
+      Drawdown = as.numeric(dd_xts)
+    )
+    
+    # 3. Cria o gráfico Plotly (Área preenchida para visualização de perdas)
+    fig <- plot_ly(df_plot, x = ~Date, y = ~Drawdown, type = 'scatter', mode = 'lines',
+                   fill = 'tozeroy', 
+                   line = list(color = '#d32f2f'), # Cor vermelha (perda)
+                   fillcolor = 'rgba(211, 47, 47, 0.4)') %>%
+      layout(
+        title = "Série Histórica de Drawdown (%)",
+        xaxis = list(title = ""),
+        # Formata o eixo Y para porcentagem
+        yaxis = list(title = "Perda Máxima (Perda/Ganho)", tickformat = "%"), 
+        legend = list(orientation = "h", x = 0, y = -0.2),
+        margin = list(b = 100, r = 20, l = 50, t = 50),
+        hovermode = "x unified"
+      )
+    
+    return(fig)
+    
+  } else {
+    plotly_empty() %>%
+      layout(title = "Aguardando geração da série de Drawdown")
+  }
+})
+```
+
+```{r portfolio-construction, include=FALSE}
+# ============================================================================
+# CONSTRUÇÃO E OTIMIZAÇÃO DO PORTIFÓLIO
+# ============================================================================
+
+# 1. Define os pesos de cada cluster para cada perfil de investidor
+get_cluster_weights_by_profile <- function(profile, n_clusters) {
+  # Define a estratégia de pesos de alocação para cada perfil
+  # Pesos são distribuidos entre os clusters baseado na relação risco-retorno de cada
+  # Assume-se ordenação dos clusters por risco (Cluster 1 = cluster de menor risco)
+  
+  if (profile == "Conservative") {
+    # Conservative: Preferência por clusters de baixa volatilidade
+    weights <- rev(seq(0.05, 0.40, length.out = n_clusters))
+  } else if (profile == "Moderate") {
+    # Moderate: Alocação balanceada entre os clusters
+    weights <- rep(1/n_clusters, n_clusters)
+  } else {  # Aggressive: Preferência por clusters de alta volatilidade
+    weights <- seq(0.05, 0.40, length.out = n_clusters)
+  }
+  
+  # Garante que a soma dos pesos é igual a 1 (normalização dos pesos)
+  weights <- weights / sum(weights)
+  
+  return(weights)
+}
+
+# 2. Seleciona o melhor ativo de cada cluster (Maior índice sharpe)
+select_best_asset_per_cluster <- function(cluster_assignments_df) {
+  # Agrupa por cluster e seleciona o ativo
+  best_assets <- cluster_assignments_df %>%
+    group_by(Cluster_ID) %>%
+    slice_max(Sharpe_Ratio, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(Cluster_ID)
+  
+  return(best_assets)
+}
+
+# 3. Construção do Portifólio Recomendado
+construct_portfolio <- function(cluster_assignments_df, investor_profile, market_data, n_clusters = NULL) {
+  # Determina o número de clusters caso não fornecido
+  if (is.null(n_clusters)) {
+    n_clusters <- length(unique(cluster_assignments_df$Cluster_ID[!is.na(cluster_assignments_df$Cluster_ID)]))
+  }
+  
+  # Seleciona os pesos de cada cluster com base no perfil
+  cluster_weights <- get_cluster_weights_by_profile(investor_profile, n_clusters)
+  
+  # Seleciona o melhor ativo de cada cluster
+  best_assets <- select_best_asset_per_cluster(cluster_assignments_df)
+  
+  # Verifica se há clusters suficientes
+  if (nrow(best_assets) < n_clusters) {
+    warning("Não foram encontrados clusters o suficiente. Ajustando pesos...")
+    n_clusters <- nrow(best_assets)
+    cluster_weights <- cluster_weights[1:n_clusters]
+    cluster_weights <- cluster_weights / sum(cluster_weights)
+  }
+  
+  # Criando dataframe do Portifólio
+  portfolio_df <- data.frame(
+    Ticker = best_assets$Ticker,
+    Cluster_ID = best_assets$Cluster_ID,
+    Weight = cluster_weights[1:nrow(best_assets)],
+    Annualized_Return = best_assets$Annualized_Return,
+    Annualized_Volatility = best_assets$Annualized_Volatility,
+    Sharpe_Ratio = best_assets$Sharpe_Ratio,
+    stringsAsFactors = FALSE
+  )
+  
+  # Garante que pesos dos ativos no portifólio somam 1
+  portfolio_df$Weight <- portfolio_df$Weight / sum(portfolio_df$Weight)
+  
+  ## CÁLCULO DAS MÉTRICAS GERAIS DO PORTIFÓLIO
+  # 1. Vetor de Pesos
+  weights_vector <- portfolio_df$Weight
+  names(weights_vector) <- portfolio_df$Ticker
+  
+  # 2. Obter retornos históricos para os ativos selecionados (para a Matriz de Covariância)
+  selected_tickers <- portfolio_df$Ticker
+  prices_subset <- market_data$prices[, selected_tickers]
+  
+  # Calcula retornos logarítmicos diários
+  returns_subset <- Return.calculate(prices_subset, method = "log")
+  returns_subset <- returns_subset[-1, ] # Remove NA inicial
+  returns_subset <- na.omit(returns_subset) # Garante dados limpos
+  
+  # 3. Matriz de Covariância Anualizada
+  # cov() calcula a covariância diária. Multiplica-se por 252 para anualizar.
+  cov_matrix_daily <- cov(returns_subset)
+  cov_matrix_annual <- cov_matrix_daily * 252
+  
+  # 4. Cálculo do Retorno do Portfólio
+  # Soma ponderada dos retornos individuais
+  portfolio_return <- sum(weights_vector * portfolio_df$Annualized_Return)
+  
+  # 5. Cálculo Matricial da Volatilidade do Portfólio
+  portfolio_variance <- as.numeric(t(weights_vector) %*% cov_matrix_annual %*% weights_vector)
+  portfolio_vol <- sqrt(portfolio_variance)
+  
+  # Portfolio Sharpe Ratio
+  portfolio_sharpe <- portfolio_return / portfolio_vol
+  
+  return(list(
+    portfolio = portfolio_df,
+    portfolio_metrics = list(
+      expected_return = portfolio_return,
+      expected_volatility = portfolio_vol,
+      sharpe_ratio = portfolio_sharpe
+    ),
+    n_clusters = n_clusters
+  ))
+}
+
+# 4. Criação do Donut Chart
+create_portfolio_donut_chart <- function(portfolio_df) {
+  library(plotly)
+  
+  # Preparação dos dados
+  plot_data <- portfolio_df %>%
+    arrange(desc(Weight)) %>%
+    mutate(
+      Label = paste0(Ticker, "\n", round(Weight * 100, 1), "%"),
+      Weight_Pct = Weight * 100
+    )
+  
+  # Cria o donut chart
+  fig <- plot_ly(
+    plot_data,
+    labels = ~Ticker,
+    values = ~Weight_Pct,
+    type = "pie",
+    hole = 0.6,
+    textinfo = "label+percent",
+    textposition = "outside",
+    hovertemplate = "<b>%{label}</b><br>Peso: %{percent}<br>Cluster: %{customdata}<extra></extra>",
+    customdata = ~Cluster_ID
+  ) %>%
+    layout(
+      title = list(
+        text = "Alocação da Carteira Recomendada",
+        font = list(size = 16)
+      ),
+      showlegend = TRUE,
+      legend = list(orientation = "v", x = 1.1, y = 0.5),
+      margin = list(l = 20, r = 20, t = 50, b = 20)
+    )
+  
+  return(fig)
+}
+```
+
+# 1ª Aba: Avaliação de Perfil do Investidor (API)
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+#### Introdução:
+
+Este dashboard utiliza algoritmos de Machine Learning (K-Means) para agrupar ativos por similaridade de risco-retorno e recomendar uma carteira personalizada baseada no seu perfil de investidor.
+
+#### Como funciona:
+1. Responda o questionário de adequação (CVM 539) na 1ª aba do dashboard
+2. O sistema agrupa ativos por características similares
+3. Seleciona o melhor ativo de cada grupo
+4. Aloca pesos baseados no seu perfil
+5. Apresenta a carteira recomendada, backtest e projeções na 2ª aba do dashboard
+
+---
+
+### Manutenção de Dados
+
+```{r maintenance-ui}
+actionButton(
+  inputId = "update_data",
+  label = "Atualizar Dados de Mercado",
+  icon = icon("sync"),
+  class = "btn-warning",
+  style = "width: 100%; margin-top: 10px;"
+)
+
+helpText("Clique para forçar o download de novos preços e atualizar o cache.", 
+         style = "font-size: 0.8em; color: #666;")
+```
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+```{r render-input-tab}
+renderUI({
+  input_tab()
+})
+```
+
+# 2ª Aba: Portifólio Recomendado
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+### Resumo da Carteira (Métricas Consolidadas)
+
+```{r projection-inputs}
+# Inputs para a simulação Monte Carlo
+numericInput(
+  inputId = "initial_investment",
+  label = "Investimento Inicial (R$)",
+  value = 10000,
+  min = 100,
+  step = 100
+)
+
+numericInput(
+  inputId = "monthly_contribution",
+  label = "Contribuição Mensal (R$)",
+  value = 500,
+  min = 0,
+  step = 50
+)
+```
+
+```{r consolidated-metrics, context="server"}
+# Renderiza os 6 Cards de métricas do portifólio
+renderUI({
+  req(portfolio_data$generated)
+
+  metrics <- portfolio_data$portfolio_metrics
+  proj_results <- portfolio_data$monte_carlo_results
+  
+  fluidRow(
+    # --- BLOCO 1: MÉTRICAS DE RISCO/RETORNO ATUAL ---
+    
+    # 1. Retorno Esperado
+    render_card_html(
+      value = paste0(round(metrics$expected_return * 100, 2), "%"),
+      caption = "Retorno Esperado (a.a.)",
+      icon_name = "chart-line",
+      bg_color = ifelse(metrics$expected_return > 0, "success", "danger")
+    ),
+    
+    # 2. Volatilidade Esperada
+    render_card_html(
+      value = paste0(round(metrics$expected_volatility * 100, 2), "%"),
+      caption = "Volatilidade (a.a.)",
+      icon_name = "bolt",
+      bg_color = "warning"
+    ),
+    
+    # 3. Sharpe Ratio
+    render_card_html(
+      value = round(metrics$sharpe_ratio, 3),
+      caption = "Sharpe Ratio",
+      icon_name = "star",
+      bg_color = "primary"
+    ),
+    
+    # Separador visual opcional
+    div(style="border-top: 1px solid #ddd; margin: 6px 0;"),
+
+    # --- BLOCO 2: PROJEÇÃO DE PATRIMÔMIO ---
+    
+    # 4. Cenário Base
+    render_card_html(
+      value = paste0("R$ ", format(round(proj_results$final_value, 0), big.mark = ".", decimal.mark = ",")),
+      caption = paste0("Patrimônio em ", proj_results$n_years, " anos (Base)"),
+      icon_name = "hand-holding-dollar",
+      bg_color = "info"
+    ),
+    
+    # 5. Cenário Pessimista (P05)
+    render_card_html(
+      value = paste0("R$ ", format(round(proj_results$final_p05, 0), big.mark = ".", decimal.mark = ",")),
+      caption = "Cenário Pessimista",
+      icon_name = "arrow-down",
+      bg_color = "gray"
+    ),
+    
+    # 6. Cenário Otimista (P95)
+    render_card_html(
+      value = paste0("R$ ", format(round(proj_results$final_p95, 0), big.mark = ".", decimal.mark = ",")),
+      caption = "Cenário Otimista",
+      icon_name = "arrow-up",
+      bg_color = "success"
+    )
+  )
+})
+```
+
+Column {data-width=700}
+-------------------------------------
+
+### Alocação da Carteira
+
+```{r portfolio-donut}
+plotlyOutput("portfolio_donut_chart", height = "400px")
+```
+
+### Composição Detalhada
+
+```{r portfolio-table}
+DT::dataTableOutput("portfolio_table")
+```
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+### Performance Histórica (Backtest 5 Anos)
+
+```{r wealth-index-combined}
+# Cria uma linha fluida para conter Gráfico (Esquerda) e Cards (Direita)
+fluidRow(
+  
+  # --- COLUNA DA ESQUERDA: GRÁFICO (Largura 9 de 12) ---
+  column(width = 9,
+    plotlyOutput("wealth_index_chart", height = "500px")
+  ),
+  
+  # --- COLUNA DA DIREITA: CARDS (Largura 3 de 12) ---
+  column(width = 3,
+    # Renderiza os cards dinamicamente
+    renderUI({
+      if (portfolio_data$generated && !is.null(portfolio_data$backtest_results)) {
+        metrics <- portfolio_data$backtest_results$metrics
+        
+        # Container para os cards
+        fluidRow(
+          # Define espaçamento entre os cards
+          style = "padding-left: 10px;", 
+          
+          # Card 1: Retorno
+          render_card_html(
+            value = paste0(round(metrics$total_return * 100, 1), "%"),
+            caption = "Retorno Total",
+            icon_name = "chart-line",
+            bg_color = ifelse(metrics$total_return > 0, "success", "danger"),
+            col_width = 12 # <--- MUDANÇA: 12 faz ocupar a linha toda (empilhar)
+          ),
+          
+          # Card 2: Volatilidade
+          render_card_html(
+            value = paste0(round(metrics$volatility * 100, 1), "%"),
+            caption = "Volatilidade Anual",
+            icon_name = "bolt",
+            bg_color = "warning",
+            col_width = 12 # <--- MUDANÇA: Empilhar
+          ),
+          
+          # Card 3: VaR
+          render_card_html(
+            value = paste0(round(metrics$var_95 * 100, 2), "%"),
+            caption = "VaR (95%)",
+            icon_name = "shield-alt",
+            bg_color = "primary",
+            col_width = 12 # <--- MUDANÇA: Empilhar
+          ),
+          
+          # Card 4: Drawdown
+          render_card_html(
+            value = paste0(round(metrics$max_drawdown * 100, 1), "%"),
+            caption = "Max Drawdown",
+            icon_name = "arrow-down",
+            bg_color = "orange",
+            col_width = 12 # <--- MUDANÇA: Empilhar
+          )
+        )
+      }
+    })
+  )
+)
+```
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+### Projeção de Monte Carlo (5 Anos)
+
+```{r monte-carlo-chart}
+plotlyOutput("monte_carlo_projection", height = "400px")
+```
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+### Risco Histórico: Drawdown da Carteira
+
+```{r drawdown-chart}
+plotlyOutput("drawdown_chart", height = "400px")
+```
+
+Column {data-width=700}
+-----------------------------------------------------------------------
+
+### Visualização dos Clusters (K-Means)
+
+```{r cluster-visualization-plot}
+sliderInput(
+  inputId = "num_assets",
+  label = "Número de Ativos na Carteira (k)",
+  min = 4,
+  max = 12,
+  value = 4, # Valor inicial
+  step = 1,
+)
+
+plotlyOutput("cluster_plot", height = "600")
+```
