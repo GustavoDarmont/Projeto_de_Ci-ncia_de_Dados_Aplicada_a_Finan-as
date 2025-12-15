@@ -1,0 +1,3 @@
+#### Dashboard desenvolvido como projeto final da disciplina de Ciência de Dados Aplicada à Finanças, da FGV EPGE: https://gustavodarmont.shinyapps.io/Dashboard_Carteira_Inteligente/
+#### Este projeto, desenvolvido em R/Shiny (Flexdashboard), aplica técnicas de Machine Learning e Finanças Quantitativas para criar um sistema automatizado de recomendação de carteiras de investimento para o mercado brasileiro (B3) com base na identificação de perfil de investidor do usuário.
+#### O sistema integra três etapas principais: a avaliação do perfil do investidor (API), a clusterização inteligente dos ativos, e a otimização da alocação de portfólio, culminando em backtesting e projeções de risco (Monte Carlo), e apresentando os resultados de forma 100% interativa.
