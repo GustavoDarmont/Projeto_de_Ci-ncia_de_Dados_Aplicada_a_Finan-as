@@ -27,6 +27,27 @@ library(plotly)
 library(DT)
 ```
 
+```{r custom-js, echo=FALSE}
+# Robust JS to switch pages
+tags$script("
+  window.flexDashboard_switchPage = function() {
+    // Find the navbar link that contains 'Portifólio' and click it
+    $('.navbar-nav a').each(function() {
+      if ($(this).text().toLowerCase().indexOf('portifólio') !== -1) {
+        $(this).tab('show'); // Force Bootstrap to show the tab
+        $(this).click();    // Trigger the flexdashboard click event
+      }
+    });
+  };
+
+  $(document).on('shiny:connected', function(event) {
+    Shiny.addCustomMessageHandler('switchPage', function(message) {
+      flexDashboard_switchPage();
+    });
+  });
+")
+```
+
 ```{r data-fetching, include=FALSE}
 # ============================================================================
 # OBTENÇÃO DE DADOS E ENGENHARIA DE FEATURE
@@ -866,6 +887,17 @@ input_tab <- function() {
       wellPanel(
         h4("Seu Perfil de Investidor"),
         verbatimTextOutput("investor_profile_output"),
+        
+        # Botão Manual de Fallback
+        hr(),
+        div(
+          p("A carteira foi gerada! Clique no botão abaixo para visualizar:"),
+          actionButton("go_to_results", "Ver Portifólio Recomendado", 
+                       class = "btn-success", icon = icon("arrow-right"),
+                       onclick = "flexDashboard_switchPage()"),
+          align = "center"
+        ),
+        
         style = "background-color: #e7f3ff; padding: 15px; border-radius: 5px; border: 2px solid #2196F3;"
       )
     )
@@ -1053,8 +1085,13 @@ observeEvent(input$generate_portfolio, {
     duration = 5
   )
   
-  # Gatilho de geração de portifólio
-  # Isso será contornado em um observeEvent separado para o botão
+  # Troca automaticamente para a aba de resultados (usando o fallback '2' no JS)
+  session$sendCustomMessage("switchPage", "2")
+})
+
+# Evento: Botão Manual de Fallback Clicado
+observeEvent(input$go_to_results, {
+  session$sendCustomMessage("switchPage", "2")
 })
 
 observe({
@@ -1815,4 +1852,3 @@ sliderInput(
 
 plotlyOutput("cluster_plot", height = "600")
 ```
-
